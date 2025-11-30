@@ -201,10 +201,13 @@ def assemble_bundle(found: Dict[str, Dict], version: str, outdir: Path, keep_tem
         if chosen is None:
             chosen = libs[0]
 
-        shutil.copy2(chosen, plat_dir / chosen.name)
+        target_name = chosen.name
+        if chosen.name == "pulsarWithDeps.lib":
+            target_name = "libpulsarwithdeps.lib"
+        shutil.copy2(chosen, plat_dir / target_name)
 
         variant = {
-            "path": str((Path("dist") / plat / chosen.name).as_posix()),
+            "path": str((Path("dist") / plat / target_name).as_posix()),
             "supportedTriples": info.get("triples", []),
             "staticLibraryMetadata": {"headerPaths": ["include"]},
         }
