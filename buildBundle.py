@@ -19,6 +19,7 @@ license files that should be copied into the bundle.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -29,51 +30,17 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from config import DEFAULT_VERSION, PLATFORMS, DOWNLOAD_BASES
+
 
 def log(msg: str) -> None:
     print(msg)
 
 
-PLATFORMS = {
-    "macos-arm64": {
-        "triples": ["arm64-apple-macosx"],
-        "candidates": [
-            "macos-arm64.zip",
-        ],
-    },
-   #"macos-x64": {
-   #    "triples": ["x86_64-apple-macosx"],
-   #    "candidates": [
-   #        "apache-pulsar-client-cpp-{v}-macosx-x86_64.tar.gz",
-   #        "apache-pulsar-client-cpp-{v}-macosx-x64.tar.gz",
-   #    ],
-   #},
-   #"linux-x64": {
-   #    "triples": ["x86_64-unknown-linux-gnu"],
-   #    "candidates": [
-   #        "apache-pulsar-client-cpp-{v}-linux-x86_64.tar.gz",
-   #        "apache-pulsar-client-cpp-{v}-linux-x64.tar.gz",
-   #    ],
-   #},
-   #"linux-arm64": {
-   #    "triples": ["aarch64-unknown-linux-gnu"],
-   #    "candidates": [
-   #        "apache-pulsar-client-cpp-{v}-linux-aarch64.tar.gz",
-   #        "apache-pulsar-client-cpp-{v}-linux-arm64.tar.gz",
-   #    ],
-   #},
-}
-
-
-DOWNLOAD_BASES = [
-    "https://downloads.apache.org/pulsar/pulsar-client-cpp-{v}/",
-    "https://archive.apache.org/dist/pulsar/pulsar-client-cpp-{v}/",
-]
-
-
 def download_file(url: str, dest: Path) -> bool:
     try:
         log(f"Downloading {url}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
             shutil.copyfileobj(r, f)
         return True
@@ -82,15 +49,57 @@ def download_file(url: str, dest: Path) -> bool:
         return False
 
 
-def try_find_and_download(version: str, candidates: List[str], workdir: Path) -> Tuple[Path, str] | None:
+def verify_checksum(file_path: Path, checksum_url: str) -> bool:
+    """Verify SHA512 checksum of a file against a remote checksum file."""
+    try:
+        log(f"Downloading checksum from {checksum_url}")
+        with urllib.request.urlopen(checksum_url) as r:
+            checksum_content = r.read().decode('utf-8').strip()
+        
+        # Parse the checksum file (format: "hash  filename" or just "hash")
+        expected_hash = checksum_content.split()[0].lower()
+        
+        log(f"Calculating SHA512 checksum for {file_path.name}")
+        sha512 = hashlib.sha512()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha512.update(chunk)
+        actual_hash = sha512.hexdigest().lower()
+        
+        if actual_hash == expected_hash:
+            log(f"  ✓ Checksum verified")
+            return True
+        else:
+            log(f"  ✗ Checksum mismatch!")
+            log(f"    Expected: {expected_hash}")
+            log(f"    Got:      {actual_hash}")
+            return False
+    except Exception as e:
+        log(f"  -> checksum verification failed: {e}")
+        return False
+
+
+def try_find_and_download(version: str, candidates: List[str], workdir: Path, platform_key: str) -> Tuple[Path, str] | None:
     for base in DOWNLOAD_BASES:
         base_filled = base.format(v=version)
         for cand in candidates:
             fname = cand.format(v=version)
             url = base_filled + fname
-            dest = workdir / fname
+            checksum_url = url + ".sha512"
+            
+            # Use platform key to create unique filenames
+            unique_fname = fname.replace("/", "_")
+            if not unique_fname.startswith(platform_key):
+                unique_fname = f"{platform_key}_{unique_fname}"
+            dest = workdir / unique_fname
+            
             if download_file(url, dest):
-                return dest, url
+                # Verify checksum
+                if verify_checksum(dest, checksum_url):
+                    return dest, url
+                else:
+                    log(f"  -> Checksum verification failed, skipping this file")
+                    dest.unlink()  # Remove the file with bad checksum
     return None
 
 
@@ -108,15 +117,25 @@ def extract_archive(archive_path: Path, dest: Path) -> None:
 def find_include_and_libs(extract_root: Path) -> Tuple[Path | None, List[Path]]:
     include = None
     libs: List[Path] = []
-    for p in extract_root.rglob("include"):
-        if p.is_dir():
-            include = p
+    
+    # Look for include/pulsar or usr/include/pulsar
+    for p in extract_root.rglob("pulsar"):
+        if p.is_dir() and p.parent.name == "include":
+            include = p.parent
             break
+    
+    # Fallback: look for any include directory
+    if not include:
+        for p in extract_root.rglob("include"):
+            if p.is_dir():
+                include = p
+                break
 
+    # Look for lib directories (lib or usr/lib)
     for p in extract_root.rglob("lib"):
         if p.is_dir():
             for f in p.iterdir():
-                if f.suffix in (".a", ".dylib", ".so"):
+                if f.suffix in (".a", ".dylib", ".so", ".lib"):
                     libs.append(f)
 
     return include, libs
@@ -171,9 +190,14 @@ def assemble_bundle(found: Dict[str, Dict], version: str, outdir: Path, keep_tem
         plat_dir.mkdir(parents=True, exist_ok=True)
         chosen = None
         for f in libs:
-            if f.name.endswith("withdeps.a") or f.suffix == ".a":
+            if f.name.endswith("withdeps.a") or f.name == "pulsarWithDeps.lib":
                 chosen = f
                 break
+        if chosen is None:
+            for f in libs:
+                if f.suffix == ".a" or (f.suffix == ".lib" and "static" in f.name.lower()):
+                    chosen = f
+                    break
         if chosen is None:
             chosen = libs[0]
 
@@ -222,20 +246,10 @@ def main(argv: List[str]) -> int:
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    existing_info = Path("resources") / "info.json"
     version = args.version
-    if not version and existing_info.exists():
-        try:
-            with open(existing_info, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                version = data.get("artifacts", {}).get("CxxPulsar", {}).get("version")
-                log(f"Inferred version {version} from {existing_info}")
-        except Exception:
-            pass
-
     if not version:
-        log("ERROR: version not specified and could not be inferred from libpulsar.artifactbundle/info.json")
-        return 2
+        version = DEFAULT_VERSION
+        log(f"Using default version {version}")
 
     workdir = Path(tempfile.mkdtemp(prefix="pulsar-cpp-bundle-"))
     log(f"Working in {workdir}")
@@ -243,7 +257,7 @@ def main(argv: List[str]) -> int:
     found: Dict[str, Dict] = {}
     try:
         for plat_key, plat_info in PLATFORMS.items():
-            res = try_find_and_download(version, plat_info["candidates"], workdir)
+            res = try_find_and_download(version, plat_info["candidates"], workdir, plat_key)
             if not res:
                 log(f"No prebuilt found for {plat_key}, skipping")
                 continue
